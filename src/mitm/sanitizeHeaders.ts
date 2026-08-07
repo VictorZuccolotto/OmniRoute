@@ -16,6 +16,7 @@ const SECRET_HEADER_NAMES = new Set([
   "api-key",
   "bearer",
   "proxy-authorization",
+  "x-conduit-token",
 ]);
 
 function isSecretHeader(name: string): boolean {
@@ -31,7 +32,7 @@ function isSecretHeader(name: string): boolean {
  * - Returns a plain Record<string, string> (never undefined values)
  */
 export function sanitizeHeaders(
-  headers: IncomingHttpHeaders | Record<string, string | string[] | undefined>,
+  headers: IncomingHttpHeaders | Record<string, string | string[] | undefined>
 ): Record<string, string> {
   const result: Record<string, string> = {};
 
@@ -51,7 +52,10 @@ export function sanitizeHeaders(
       // `set-cookie` carries an entire session/CSRF cookie value that maskSecret's
       // format heuristics (Bearer / sk- / ≥40-char) do NOT catch, so it would leak
       // verbatim into inspector JSON — fully redact it (SECURITY_AUDIT M6).
-      result[lowerKey] = lowerKey === "set-cookie" ? "[REDACTED]" : maskSecret(strValue);
+      result[lowerKey] =
+        lowerKey === "set-cookie" || lowerKey === "x-conduit-token"
+          ? "[REDACTED]"
+          : maskSecret(strValue);
     } else {
       result[lowerKey] = strValue;
     }

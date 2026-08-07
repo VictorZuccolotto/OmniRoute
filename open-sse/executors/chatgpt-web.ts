@@ -1,19 +1,4 @@
-/**
- * ChatGptWebExecutor — ChatGPT Web Session Provider
- *
- * Routes requests through chatgpt.com's internal SSE API using a Plus/Pro
- * subscription session cookie, translating between OpenAI chat completions
- * format and ChatGPT's internal protocol.
- *
- * Auth pipeline (per request):
- *   1. exchangeSession()          GET  /api/auth/session       cookie → JWT accessToken (cached ~5min)
- *   2. prepareChatRequirements()  POST /backend-api/sentinel/chat-requirements
- *                                                              → { proofofwork.seed, difficulty, persona }
- *   3. solveProofOfWork()         SHA3-512 hash loop           → "gAAAAAB…" sentinel proof token
- *   4. fetch /backend-api/conversation                         with Bearer + sentinel-proof-token + browser UA
- *
- * Response is the standard ChatGPT SSE format (cumulative `parts[0]` strings, not deltas).
- */
+/** ChatGPT Web session executor for the internal SSE conversation protocol. */
 
 import { BaseExecutor, type ExecuteInput, type ProviderCredentials } from "./base.ts";
 import { describeChatGptWebHttpError } from "./chatgptWebErrors.ts";
@@ -35,6 +20,18 @@ import {
 import { isThinkingCapableModel, resolveChatGptModel } from "./chatgpt-web/models.ts";
 import { cleanChatGptText } from "./chatgpt-web/citations.ts";
 import { resumeChatGptHandoff, type FinalAssistantAnswer } from "./chatgpt-web/handoff.ts";
+import {
+  CUSTOM_GPT_MISMATCH_MESSAGE,
+  CustomGptInputError,
+  resolveCustomGptId,
+} from "./chatgpt-web/customGpt.ts";
+import {
+  attachChatGptInputImages,
+  ChatGptImageInputError,
+  extractChatGptInputImages,
+  uploadChatGptInputImages,
+} from "./chatgpt-web/uploads.ts";
+import { sanitizeErrorMessage } from "../utils/error.ts";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -81,11 +78,6 @@ function deviceIdFor(cookie: string): string {
   }
   return id;
 }
-
-// OmniRoute model ID → ChatGPT internal slug. The public ChatGPT Web catalog
-// keeps OmniRoute's historical dot-form IDs (e.g. "gpt-5.5-pro"), while
-// ChatGPT's backend routes use dash-form slugs (e.g. "gpt-5-5-pro"). The slug
-// catalog comes from /backend-api/models on a logged-in account.
 
 // ─── Browser-like default headers ──────────────────────────────────────────
 
@@ -160,11 +152,8 @@ function tokenStore(cookie: string, entry: TokenEntry): void {
   tokenCache.set(cookieKey(cookie), entry);
 }
 
-// Conversation continuity is intentionally not cached. Open WebUI and most
-// OpenAI-API-style clients re-send the full history each turn, so each
-// request just starts a fresh conversation. Temporary Chat mode is the
-// default; it gets disabled per-request only for image-gen prompts, since
-// that mode rejects the image_gen tool.
+// Text continuity is stateless: OpenAI-style clients replay history, so each
+// request starts a fresh temporary conversation. Images retain native state.
 
 // ─── /api/auth/session — exchange cookie for JWT ────────────────────────────
 
@@ -813,20 +802,7 @@ interface ParsedMessages {
   latestImageContext: ChatGptImageConversationContext | null;
 }
 
-/**
- * Strip embedded `data:image/...` URIs out of message content so prior
- * generated images don't get fed back into chatgpt.com on the next turn.
- *
- * Why: when image generation succeeds we emit `![image](data:image/png;base64,...)`
- * — frequently 2–4 MB. Chat clients (Open WebUI, OpenAI-style apps) replay
- * the full conversation history on the next request, so without this strip
- * we'd send megabytes of base64 back upstream. chatgpt.com responds with an
- * empty body when that happens (verified: 502 "ChatGPT returned empty
- * response body" on the very next turn after an image gen succeeds), and
- * even if it didn't, a single inlined image is well past the model's context
- * limit. Replacing with a short placeholder keeps semantic continuity
- * without the bytes.
- */
+// Strip replayed generated-image data URLs from textual history.
 const DATA_URI_IMAGE_RE = /!\[([^\]]*)\]\(data:image\/[^)]+\)/g;
 const CACHED_IMAGE_URL_RE = /\/v1\/chatgpt-web\/image\/([a-f0-9]{16,64})(?=[)\s"'<>]|$)/gi;
 
@@ -892,23 +868,7 @@ interface ChatGptMessage {
   content: { content_type: "text"; parts: string[] };
 }
 
-/**
- * Cheap heuristic: does the last user turn look like an image-generation
- * request? Used to decide whether to disable Temporary Chat mode.
- *
- * Why a heuristic instead of always disabling Temporary Chat: when
- * `history_and_training_disabled: false`, every conversation gets saved to
- * the user's chatgpt.com history. For text-only chats that's noise — a
- * dozen "OmniRoute" entries clutter the sidebar and can interact with
- * ChatGPT's memory. We pay that cost only when the user actually wants an
- * image, since Temporary Chat refuses image_gen with the message
- * "I cannot generate images in this chat".
- *
- * False positives (text chat misclassified as image) → unnecessary history
- * entry. False negatives (image request misclassified as text) → ChatGPT
- * refuses image_gen and the user retries. Tuning leans toward false
- * positives (we'd rather pollute history than refuse image generation).
- */
+// Image generation needs a durable conversation; ordinary text stays temporary.
 const IMAGE_GEN_REGEXES: RegExp[] = [
   // verb + (anything within 40 chars) + image-noun
   /\b(?:generate|create|make|draw|paint|render|produce|design|sketch|illustrate|show me)\b[\s\S]{0,40}\b(?:image|picture|photo|photograph|drawing|illustration|sketch|painting|portrait|logo|icon|art|artwork|wallpaper|render|graphic)\b/i,
@@ -920,17 +880,6 @@ const IMAGE_GEN_REGEXES: RegExp[] = [
   /^\s*\/(?:image|imagine|img|draw|paint)\b/im,
 ];
 
-/**
- * Markers Open WebUI uses for its background tool prompts (follow-up
- * suggestions, title generation, tag categorization). These prompts embed
- * the prior conversation in `<chat_history>` blocks and frequently quote
- * the user's earlier "generate an image of..." request — which would
- * trip the image-gen regex below. Skip them so we don't unnecessarily
- * disable Temporary Chat and trigger image_gen on background tasks.
- *
- * Catching just one of these markers is enough; tool prompts always
- * include several together.
- */
 const OPENWEBUI_TOOL_PROMPT_MARKERS = [
   /<chat_history>/i,
   /^### Task:/im,
@@ -981,23 +930,14 @@ function buildConversationBody(
   modelSlug: string,
   parentMessageId: string,
   options: {
-    // Keep text/API calls in Temporary Chat so they do not clutter the user's
-    // chatgpt.com history. Disable Temporary Chat only when ChatGPT needs a
-    // durable image conversation (image generation/editing).
     persistConversation: boolean;
     thinkingEffort: "standard" | "extended" | null;
+    customGptId: string | null;
     continuation?: ChatGptImageConversationContext | null;
   }
 ): Record<string, unknown> {
-  // Critical: do NOT send prior turns as separate `assistant` and `user`
-  // messages in the `messages` array. ChatGPT's web API ("action: next")
-  // treats those as in-progress turns and the model will literally CONTINUE
-  // a prior assistant response in the new generation — observed as
-  // `[1] -> [12] -> [1123]` across three turns.
-  //
-  // Instead, fold all prior history into the system message and send only
-  // the current user message as a single new turn. The model then sees a
-  // single prompt with full context and responds fresh.
+  // Separate historical turns make ChatGPT continue old assistant output;
+  // fold replayed history into context and submit only the newest user turn.
   const systemParts: string[] = [];
   if (parsed.systemMsg.trim()) {
     systemParts.push(parsed.systemMsg.trim());
@@ -1036,10 +976,6 @@ function buildConversationBody(
     action: "next",
     messages,
     model: modelSlug,
-    // Text-only API-style requests start fresh because clients replay full
-    // history. Generated-image edits are the exception: ChatGPT needs the
-    // original conversation node to adjust the actual image, not just a
-    // markdown URL echoed back in a synthetic history block.
     conversation_id: continuation?.conversationId ?? null,
     parent_message_id: continuation?.parentMessageId ?? parentMessageId,
     timezone_offset_min: -new Date().getTimezoneOffset(),
@@ -1048,7 +984,9 @@ function buildConversationBody(
     history_and_training_disabled: !options.persistConversation,
     suggestions: [],
     websocket_request_id: randomUUID(),
-    conversation_mode: { kind: "primary_assistant" },
+    conversation_mode: options.customGptId
+      ? { kind: "gizmo_interaction", gizmo_id: options.customGptId }
+      : { kind: "primary_assistant" },
     supports_buffering: true,
     force_parallel_switch: "auto",
     paragen_cot_summary_display_override: "allow",
@@ -1589,25 +1527,12 @@ function sseChunk(data: unknown): string {
   return `data: ${JSON.stringify(data)}\n\n`;
 }
 
-/**
- * Resolves a ChatGPT asset_pointer to a downloadable URL, given the live
- * conversation_id (needed for sediment:// pointers). Returns null on failure
- * so the caller can decide whether to surface a placeholder or skip silently.
- */
 type ImageResolver = (
   assetPointer: string,
   conversationId: string | null,
   parentMessageId?: string | null
 ) => Promise<string | null>;
 
-/**
- * True when ChatGPT emitted an image asset pointer (the image WAS generated
- * upstream) but none of the pointers could be resolved to a downloadable URL
- * — so the assistant text carries no image markdown. Lets callers surface an
- * accurate "generated but not retrievable" error instead of the misleading
- * "no image was produced". Escalated mesh report: image visible in the ChatGPT
- * chat but returned to OmniRoute as a bare "completed without image markdown".
- */
 export function detectImageResolutionFailure(pointerCount: number, resolvedCount: number): boolean {
   return pointerCount > 0 && resolvedCount === 0;
 }
@@ -2158,7 +2083,13 @@ async function buildNonStreamingResponse(
 
 function errorResponse(status: number, message: string, code?: string): Response {
   return new Response(
-    JSON.stringify({ error: { message, type: "upstream_error", ...(code ? { code } : {}) } }),
+    JSON.stringify({
+      error: {
+        message: sanitizeErrorMessage(message),
+        type: "upstream_error",
+        ...(code ? { code } : {}),
+      },
+    }),
     { status, headers: { "Content-Type": "application/json" } }
   );
 }
@@ -2262,6 +2193,7 @@ interface ResolverContext {
   sessionId: string;
   deviceId: string;
   cookie: string;
+  customGptId: string | null;
   signal?: AbortSignal | null;
   log?: { debug?: (tag: string, msg: string) => void; warn?: (tag: string, msg: string) => void };
   /**
@@ -2306,15 +2238,6 @@ async function fetchDownloadUrl(endpoint: string, ctx: ResolverContext): Promise
   return parsed.download_url ?? null;
 }
 
-/**
- * Download a chatgpt.com signed image URL and re-serve it from OmniRoute's
- * short-lived image cache. The URLs returned by /files/<id>/download and
- * /conversation/<cid>/attachment/<fid>/download point at chatgpt.com's
- * estuary endpoint, which 403s for any request without the user's session
- * cookie. Downstream clients (Open WebUI, OpenAI-compatible apps) won't
- * have those cookies, so we download once via the authenticated TLS client
- * and return a browser-fetchable OmniRoute URL.
- */
 const IMAGE_DOWNLOAD_MAX_BYTES = 8 * 1024 * 1024;
 
 async function imageUrlToCachedImageUrl(
@@ -2697,9 +2620,10 @@ async function pollForAsyncImage(
         const message = node?.message;
         const parts = message?.content?.parts;
         if (!Array.isArray(parts)) continue;
-        const pointers = extractImagePointers(parts).map(
-          (pointer) => ({ pointer, messageId: message?.id })
-        );
+        const pointers = extractImagePointers(parts).map((pointer) => ({
+          pointer,
+          messageId: message?.id,
+        }));
         if (pointers.length === 0) continue;
         const at = message?.create_time ?? 0;
         if (!newest || at >= newest.at) newest = { pointers, at };
@@ -2718,9 +2642,7 @@ async function pollForAsyncImage(
 }
 
 function makeImageResolver(ctx: ResolverContext): ImageResolver {
-  // Cache resolutions across the same request — the same pointer can show up
-  // on multiple SSE events (in-progress + finished_successfully). One HTTP
-  // round-trip per unique pointer is enough.
+  // The same pointer can appear in multiple SSE events; resolve it only once.
   const cache = new Map<string, string | null>();
 
   return async (assetPointer, conversationId, parentMessageId) => {
@@ -2737,20 +2659,7 @@ function makeImageResolver(ctx: ResolverContext): ImageResolver {
 
     let signedUrl: string | null = null;
     if (fileId) {
-      // Both endpoints return a chatgpt.com estuary URL signed for the
-      // user's current session — that URL 403s without the cookie, so
-      // downstream clients can't fetch it directly. We download once via
-      // the authenticated TLS client and expose the bytes through
-      // OmniRoute's short-lived image cache.
-      //
-      // /files/{id}/download is the historical path. It works for
-      // chat-uploaded files and the older image_gen output format
-      // (`file-XXXX`). Newer image-edit results from continued
-      // conversations land with a `file_00000000XXXX` shape that 422s on
-      // /files/{id}/download — they're conversation-scoped attachments
-      // and only resolve through /conversation/{cid}/attachment/{fid}/
-      // download. We try /files first because it's cheaper and works for
-      // the common case, then fall through.
+      // New image-edit pointers may require the conversation attachment path.
       signedUrl = await fetchDownloadUrl(
         `${CHATGPT_BASE}/backend-api/files/${encodeURIComponent(fileId)}/download`,
         ctx
@@ -2765,16 +2674,17 @@ function makeImageResolver(ctx: ResolverContext): ImageResolver {
 
     let finalUrl: string | null = null;
     if (signedUrl) {
-      // chatgpt.com signed URLs require the user's session cookie to fetch,
-      // so we materialize the bytes into our own cache and emit an OmniRoute
-      // URL. If that fails (oversize, network error, etc.) we return null —
-      // never the signed URL — because handing it back would emit broken
-      // markdown that 403s for the client. Better to drop the image silently
-      // than render a broken link.
+      // Never expose the session-bound signed URL to downstream clients.
       finalUrl = await imageUrlToCachedImageUrl(
         signedUrl,
         ctx,
-        conversationId && parentMessageId ? { conversationId, parentMessageId } : undefined
+        conversationId && parentMessageId
+          ? {
+              conversationId,
+              parentMessageId,
+              ...(ctx.customGptId ? { customGptId: ctx.customGptId } : {}),
+            }
+          : undefined
       );
     }
     cache.set(assetPointer, finalUrl);
@@ -2805,11 +2715,24 @@ export class ChatGptWebExecutor extends BaseExecutor {
     onCredentialsRefreshed,
     clientHeaders,
   }: ExecuteInput) {
-    const messages = (body as Record<string, unknown> | null)?.messages as
-      Array<Record<string, unknown>> | undefined;
+    const requestBody = (body ?? {}) as Record<string, unknown>;
+    const messages = requestBody.messages as Array<Record<string, unknown>> | undefined;
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return {
         response: errorResponse(400, "Missing or empty messages array"),
+        url: CONV_URL,
+        headers: {},
+        transformedBody: body,
+      };
+    }
+
+    let customGptId: string | null;
+    try {
+      customGptId = resolveCustomGptId(requestBody);
+    } catch (err) {
+      const inputError = err instanceof CustomGptInputError ? err : new CustomGptInputError();
+      return {
+        response: errorResponse(400, inputError.message, inputError.code),
         url: CONV_URL,
         headers: {},
         transformedBody: body,
@@ -2822,12 +2745,32 @@ export class ChatGptWebExecutor extends BaseExecutor {
       (body || {}) as Record<string, unknown>,
       messages as Array<{ role: string; content: unknown }>
     );
+    let inputImages: ReturnType<typeof extractChatGptInputImages>;
+    try {
+      inputImages = extractChatGptInputImages(effectiveMessages);
+    } catch (err) {
+      const imageError =
+        err instanceof ChatGptImageInputError
+          ? err
+          : new ChatGptImageInputError(
+              "Invalid ChatGPT Web image input.",
+              400,
+              "INVALID_CHATGPT_WEB_IMAGE"
+            );
+      return {
+        response: errorResponse(imageError.status, imageError.message, imageError.code),
+        url: CONV_URL,
+        headers: {},
+        transformedBody: body,
+      };
+    }
 
     if (!credentials.apiKey) {
       return {
         response: errorResponse(
           401,
-          "ChatGPT auth failed — paste your __Secure-next-auth.session-token cookie value."
+          "ChatGPT auth failed — paste your __Secure-next-auth.session-token cookie value.",
+          "CHATGPT_WEB_SESSION_EXPIRED"
         ),
         url: CONV_URL,
         headers: {},
@@ -2851,7 +2794,7 @@ export class ChatGptWebExecutor extends BaseExecutor {
           response: errorResponse(
             401,
             "ChatGPT auth failed — re-paste your __Secure-next-auth.session-token cookie from chatgpt.com.",
-            "HTTP_401"
+            "CHATGPT_WEB_SESSION_EXPIRED"
           ),
           url: SESSION_URL,
           headers: {},
@@ -3010,7 +2953,7 @@ export class ChatGptWebExecutor extends BaseExecutor {
 
     // 4. Build conversation request
     const parsed = parseOpenAIMessages(effectiveMessages);
-    if (!parsed.currentMsg.trim() && parsed.history.length === 0) {
+    if (!parsed.currentMsg.trim() && parsed.history.length === 0 && inputImages.length === 0) {
       return {
         response: errorResponse(400, "Empty user message"),
         url: CONV_URL,
@@ -3024,6 +2967,18 @@ export class ChatGptWebExecutor extends BaseExecutor {
     // they do not show up in the user's chatgpt.com sidebar/history.
     const imageEdit = looksLikeImageEditRequest(parsed);
     const continuation = imageEdit ? parsed.latestImageContext : null;
+    if (continuation && (continuation.customGptId ?? null) !== customGptId) {
+      return {
+        response: errorResponse(
+          409,
+          CUSTOM_GPT_MISMATCH_MESSAGE,
+          "CUSTOM_GPT_CONVERSATION_MISMATCH"
+        ),
+        url: CONV_URL,
+        headers: {},
+        transformedBody: body,
+      };
+    }
     const forImageGen = looksLikeImageGenRequest(parsed) || imageEdit;
     const persistConversation = forImageGen || !!continuation;
     if (forImageGen) {
@@ -3041,6 +2996,7 @@ export class ChatGptWebExecutor extends BaseExecutor {
     const cgptBody = buildConversationBody(parsed, modelSlug, parentMessageId, {
       persistConversation,
       thinkingEffort: requestedEffort,
+      customGptId,
       continuation,
     });
 
@@ -3059,6 +3015,37 @@ export class ChatGptWebExecutor extends BaseExecutor {
       headers["openai-sentinel-chat-requirements-prepare-token"] = reqs.prepare_token;
     if (proofToken) headers["openai-sentinel-proof-token"] = proofToken;
     if (turnstileToken) headers["openai-sentinel-turnstile-token"] = turnstileToken;
+
+    if (inputImages.length > 0) {
+      try {
+        const uploaded = await uploadChatGptInputImages(inputImages, {
+          conversationBody: cgptBody,
+          headers,
+          signal,
+          log,
+        });
+        attachChatGptInputImages(cgptBody, uploaded.images);
+        inputImages.length = 0;
+        headers["x-conduit-token"] = uploaded.conduitToken;
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        const imageError =
+          err instanceof ChatGptImageInputError
+            ? err
+            : new ChatGptImageInputError(
+                "ChatGPT Web image upload failed.",
+                502,
+                "CHATGPT_WEB_IMAGE_UPLOAD_FAILED"
+              );
+        log?.warn?.("CGPT-WEB", `${imageError.code} (${imageError.status})`);
+        return {
+          response: errorResponse(imageError.status, imageError.message, imageError.code),
+          url: CONV_URL,
+          headers: {},
+          transformedBody: cgptBody,
+        };
+      }
+    }
 
     log?.info?.("CGPT-WEB", `Conversation request → ${modelSlug} (pow=${!!proofToken})`);
 
@@ -3097,13 +3084,24 @@ export class ChatGptWebExecutor extends BaseExecutor {
       // upstream message is much more useful than our wrapper. Goes through
       // the executor logger so it respects the application's log config.
       log?.warn?.("CGPT-WEB", `conv ${status}: ${(response.text || "").slice(0, 400)}`);
-      const errMsg = describeChatGptWebHttpError(status);
+      const customGptNotAccessible = !!customGptId && status === 404;
+      const errMsg = customGptNotAccessible
+        ? "The Custom GPT does not exist or is not accessible to the authenticated account."
+        : describeChatGptWebHttpError(status);
       if (status === 401 || status === 403) {
         tokenCache.delete(cookieKey(cookie));
       }
       log?.warn?.("CGPT-WEB", errMsg);
       return {
-        response: errorResponse(status, errMsg, `HTTP_${status}`),
+        response: errorResponse(
+          status,
+          errMsg,
+          customGptNotAccessible
+            ? "CUSTOM_GPT_NOT_ACCESSIBLE"
+            : status === 401 || status === 403
+              ? "CHATGPT_WEB_SESSION_EXPIRED"
+              : `HTTP_${status}`
+        ),
         url: CONV_URL,
         headers,
         transformedBody: cgptBody,
@@ -3137,6 +3135,7 @@ export class ChatGptWebExecutor extends BaseExecutor {
       sessionId,
       deviceId,
       cookie,
+      customGptId,
       signal,
       log,
       publicBaseUrl: derivePublicBaseUrl(clientHeaders, log),

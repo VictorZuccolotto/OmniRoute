@@ -7554,6 +7554,20 @@ components:
         stream:
           type: boolean
           default: false
+        custom_gpt_id:
+          type: string
+          pattern: "^g-[A-Za-z0-9]+$"
+          description: >-
+            ChatGPT Web only. Selects a Custom GPT by its g-... identifier.
+            When custom_gpt_url is also present, both values must identify the same GPT.
+          example: g-AbC123xyz
+        custom_gpt_url:
+          type: string
+          format: uri
+          description: >-
+            ChatGPT Web only. HTTPS chatgpt.com/g/g-... URL for a Custom GPT.
+            Arbitrary domains are rejected.
+          example: https://chatgpt.com/g/g-AbC123xyz/my-gpt
         temperature:
           type: number
           minimum: 0

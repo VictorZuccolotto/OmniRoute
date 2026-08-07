@@ -174,7 +174,8 @@ export class TlsClientUnavailableError extends Error {
 export interface TlsFetchOptions {
   method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
   headers?: Record<string, string>;
-  body?: string;
+  body?: string | ArrayBuffer | ArrayBufferView;
+  followRedirects?: boolean;
   timeoutMs?: number;
   signal?: AbortSignal | null;
   /**
@@ -277,7 +278,7 @@ export async function tlsFetchChatGpt(
     body: options.body,
     tlsClientIdentifier: CHATGPT_PROFILE,
     timeoutMilliseconds: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    followRedirects: true,
+    followRedirects: options.followRedirects ?? true,
     withRandomTLSExtensionOrder: true,
     isByteResponse: options.byteResponse === true,
     // Plumb the configured proxy through to the native binding. tls-client-node

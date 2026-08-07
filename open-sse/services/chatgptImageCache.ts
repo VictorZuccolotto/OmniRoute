@@ -49,6 +49,7 @@ function configuredMaxBytes(): number {
 export interface ChatGptImageConversationContext {
   conversationId: string;
   parentMessageId: string;
+  customGptId?: string;
 }
 
 function deleteEntry(id: string): void {
