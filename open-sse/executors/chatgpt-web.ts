@@ -41,7 +41,6 @@ const SENTINEL_PREPARE_URL = `${CHATGPT_BASE}/backend-api/sentinel/chat-requirem
 const SENTINEL_CR_URL = `${CHATGPT_BASE}/backend-api/sentinel/chat-requirements`;
 const CONV_URL = `${CHATGPT_BASE}/backend-api/f/conversation`;
 const USER_LAST_USED_MODEL_CONFIG_URL = `${CHATGPT_BASE}/backend-api/settings/user_last_used_model_config`;
-
 const DEFAULT_PRO_POLL_TIMEOUT_MS = 20 * 60_000;
 const DEFAULT_PRO_POLL_INTERVAL_MS = 4_000;
 
@@ -2195,7 +2194,7 @@ interface ResolverContext {
   cookie: string;
   customGptId: string | null;
   signal?: AbortSignal | null;
-  log?: { debug?: (tag: string, msg: string) => void; warn?: (tag: string, msg: string) => void };
+  log?: Partial<Record<"debug" | "info" | "warn", (tag: string, msg: string) => void>>;
   /**
    * Absolute base URL that downstream clients should use to fetch cached
    * images served by /v1/chatgpt-web/image/<id>. Derived from the inbound
