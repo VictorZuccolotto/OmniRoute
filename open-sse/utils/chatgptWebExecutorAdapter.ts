@@ -2,7 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-import { acquireBrowserContext, openPage } from "../services/browserPool.ts";
+import {
+  acquireBrowserContext,
+  openPage,
+  type BrowserPoolContextOptions,
+} from "../services/browserPool.ts";
 import type { ExecuteInput, ProviderCredentials } from "../executors/base.ts";
 import {
   extractChatGptWebAttachmentSources,
@@ -370,15 +374,11 @@ export function resolveChatGptWebChromeExecutable(
   );
 }
 
-async function createDefaultSession(
+/** Browser-pool context options for one ChatGPT Web connection's logged-in page. */
+export function chatGptWebBrowserContextOptions(
   input: ChatGptWebSessionFactoryInput
-): Promise<ChatGptWebBrowserSession> {
-  const digest = createHash("sha256")
-    .update(input.connectionId)
-    .update("\0")
-    .update(JSON.stringify(input.storageState))
-    .digest("hex");
-  const pooled = await acquireBrowserContext(`chatgpt-web-cleanroom:${digest}`, {
+): BrowserPoolContextOptions {
+  return {
     cookieDomain: "chatgpt.com",
     storageState: input.storageState,
     userAgent: input.userAgent,
@@ -388,7 +388,24 @@ async function createDefaultSession(
     warmupUrl: CHATGPT_WEB_PAGE_URL,
     headless: false,
     executablePath: input.chromeExecutablePath,
-  });
+    // Logged-in chatgpt.com answers with a nonce-only script-src CSP, which blocks the
+    // blob: module that loads the first-party bridge ("bridge module failed to load").
+    bypassCSP: true,
+  };
+}
+
+async function createDefaultSession(
+  input: ChatGptWebSessionFactoryInput
+): Promise<ChatGptWebBrowserSession> {
+  const digest = createHash("sha256")
+    .update(input.connectionId)
+    .update("\0")
+    .update(JSON.stringify(input.storageState))
+    .digest("hex");
+  const pooled = await acquireBrowserContext(
+    `chatgpt-web-cleanroom:${digest}`,
+    chatGptWebBrowserContextOptions(input)
+  );
   const page =
     pooled.warmupPage && !pooled.warmupPage.isClosed() ? pooled.warmupPage : await openPage(pooled);
   if (pooled.warmupPage !== page) pooled.warmupPage = page;

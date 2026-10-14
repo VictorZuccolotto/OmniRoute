@@ -49,6 +49,8 @@ export interface BrowserPoolContextOptions {
   headless?: boolean;
   /** Optional system Chrome/Chromium path, primarily for headed contexts. */
   executablePath?: string;
+  /** Disable the page's Content-Security-Policy for callers that inject their own module scripts. */
+  bypassCSP?: boolean;
 }
 
 export interface PooledContext {
@@ -483,6 +485,25 @@ async function createWarmupPage(
   }
 }
 
+/** `newContext()` options for a pooled context. */
+export function resolveBrowserContextOptions(
+  options: Pick<
+    BrowserPoolContextOptions,
+    "userAgent" | "locale" | "timezone" | "storageState" | "bypassCSP"
+  >,
+  proxy?: import("playwright").BrowserContextOptions["proxy"]
+): import("playwright").BrowserContextOptions {
+  return {
+    userAgent: options.userAgent || DEFAULT_USER_AGENT,
+    locale: options.locale || "en-US",
+    timezoneId: options.timezone || "America/New_York",
+    viewport: { width: 1280, height: 800 },
+    ...(options.storageState ? { storageState: options.storageState } : {}),
+    ...(proxy ? { proxy } : {}),
+    ...(options.bypassCSP ? { bypassCSP: true } : {}),
+  };
+}
+
 export async function acquireBrowserContext(
   key: string,
   options: BrowserPoolContextOptions
@@ -513,14 +534,7 @@ export async function acquireBrowserContext(
       resolveBrowserContextProxy(key, options),
     ]);
     const isStealth = headless && (state.engine === "obscura" || state.cloakLaunch !== null);
-    const context = await browser.newContext({
-      userAgent: options.userAgent || DEFAULT_USER_AGENT,
-      locale: options.locale || "en-US",
-      timezoneId: options.timezone || "America/New_York",
-      viewport: { width: 1280, height: 800 },
-      ...(options.storageState ? { storageState: options.storageState } : {}),
-      ...(proxy ? { proxy } : {}),
-    });
+    const context = await browser.newContext(resolveBrowserContextOptions(options, proxy));
 
     await seedContextSession(context, options);
     const warmupPage = await createWarmupPage(context, options.warmupUrl);
