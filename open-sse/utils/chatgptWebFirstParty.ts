@@ -1,6 +1,7 @@
 import type { Page } from "playwright";
 
 import type { ChatGptWebResolvedAttachment } from "./chatgptWebAttachments.ts";
+import { chatGptWebConversationMode } from "./chatgptWebCustomGpt.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -20,6 +21,8 @@ export interface ChatGptWebFirstPartyRequest {
   prompt: string;
   attachments: ChatGptWebResolvedAttachment[];
   selection: ChatGptWebUiSelection;
+  /** Normalized `g-...` ID; the conversation runs in that Custom GPT's gizmo mode. */
+  customGptId?: string | null;
 }
 
 export type ChatGptWebUiSelection =
@@ -804,8 +807,9 @@ async function storeConversationDraft(
   registered: BrowserConversationAttachment[]
 ): Promise<void> {
   const mode = directModel(input.selection);
+  const conversationMode = chatGptWebConversationMode(input.customGptId);
   await page.evaluate(
-    ({ mode, prompt, registered, requestId, requestKey }) => {
+    ({ conversationMode, mode, prompt, registered, requestId, requestKey }) => {
       const root = globalThis as typeof globalThis & Record<string, unknown>;
       const images = registered.filter((item) => item.kind === "image");
       const attachments = registered.map((item) => ({
@@ -857,7 +861,7 @@ async function storeConversationDraft(
           timezone_offset_min: new Date().getTimezoneOffset(),
           timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
           history_and_training_disabled: true,
-          conversation_mode: { kind: "primary_assistant" },
+          conversation_mode: conversationMode,
           system_hints: mode.reason ? ["reason"] : [],
           supports_buffering: true,
           supported_encodings: ["v1"],
@@ -865,6 +869,7 @@ async function storeConversationDraft(
       };
     },
     {
+      conversationMode,
       mode,
       prompt: input.prompt,
       registered,

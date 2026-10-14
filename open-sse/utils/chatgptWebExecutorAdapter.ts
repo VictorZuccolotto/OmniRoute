@@ -18,6 +18,11 @@ import {
   type ChatGptWebBrowserTurnResult,
   type ChatGptWebUiSelection,
 } from "./chatgptWebBrowserSession.ts";
+import {
+  CustomGptNotAccessibleError,
+  isConversationNotFoundError,
+  resolveCustomGptId,
+} from "./chatgptWebCustomGpt.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -50,6 +55,8 @@ export interface PreparedChatGptWebBrowserRequest {
   prompt: string;
   selection: ChatGptWebUiSelection;
   attachments: ChatGptWebAttachmentSource[];
+  /** Present only when the request selects a Custom GPT (`custom_gpt_id` / `custom_gpt_url`). */
+  customGptId?: string;
 }
 
 export interface ChatGptWebSessionFactoryInput {
@@ -297,11 +304,17 @@ export function prepareChatGptWebBrowserRequest(
   body: unknown
 ): PreparedChatGptWebBrowserRequest {
   if (!isRecord(body)) throw new Error("ChatGPT Web clean-room adapter requires an object body");
+  const customGptId = resolveCustomGptId(body);
   const prompt = buildPrompt(body);
   const attachments = extractChatGptWebAttachmentSources(
     body.messages as Array<{ role?: string; content?: unknown }>
   );
-  return { prompt, selection: resolveSelection(model, body), attachments };
+  return {
+    prompt,
+    selection: resolveSelection(model, body),
+    attachments,
+    ...(customGptId ? { customGptId } : {}),
+  };
 }
 
 function readStorageState(credentials: ProviderCredentials): ChatGptWebStorageState {
@@ -460,11 +473,20 @@ export async function executeChatGptWebCleanRoom(
       optionalString(providerData?.chromeExecutablePath)
     ),
   });
-  const result = await (deps.runTurn ?? runChatGptWebBrowserTurn)(session, {
-    prompt: prepared.prompt,
-    attachments,
-    signal: input.signal,
-  });
+  let result: ChatGptWebBrowserTurnResult;
+  try {
+    result = await (deps.runTurn ?? runChatGptWebBrowserTurn)(session, {
+      prompt: prepared.prompt,
+      attachments,
+      signal: input.signal,
+      ...(prepared.customGptId ? { customGptId: prepared.customGptId } : {}),
+    });
+  } catch (error) {
+    if (prepared.customGptId && isConversationNotFoundError(error)) {
+      throw new CustomGptNotAccessibleError();
+    }
+    throw error;
+  }
   return buildChatGptWebOpenAiResponse(input.model, result, input.stream, {
     id: deps.id?.(),
     created: deps.now ? Math.floor(deps.now() / 1000) : undefined,

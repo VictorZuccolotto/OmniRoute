@@ -1,9 +1,10 @@
 import { chatgpt_webProvider } from "../config/providers/registry/chatgpt-web/index.ts";
+import { CustomGptInputError, CustomGptNotAccessibleError } from "../utils/chatgptWebCustomGpt.ts";
 import {
   executeChatGptWebCleanRoom,
   type ChatGptWebExecutorAdapterDeps,
 } from "../utils/chatgptWebExecutorAdapter.ts";
-import { makeExecutorErrorResult, sanitizeErrorMessage } from "../utils/error.ts";
+import { errorResponse, makeExecutorErrorResult, sanitizeErrorMessage } from "../utils/error.ts";
 import { BaseExecutor, type ExecuteInput } from "./base.ts";
 
 const CHATGPT_WEB_URL = "https://chatgpt.com";
@@ -37,6 +38,17 @@ export class ChatGptWebExecutor extends BaseExecutor {
     try {
       return await executeChatGptWebCleanRoom(input, this.deps);
     } catch (error) {
+      if (error instanceof CustomGptInputError || error instanceof CustomGptNotAccessibleError) {
+        return {
+          response: errorResponse(error.status, error.message, {
+            code: error.code,
+            type: "invalid_request_error",
+          }),
+          url: CHATGPT_WEB_URL,
+          headers: {} as Record<string, string>,
+          transformedBody: input.body,
+        };
+      }
       const message = sanitizeErrorMessage(error);
       return makeExecutorErrorResult(
         statusForAdapterError(message),

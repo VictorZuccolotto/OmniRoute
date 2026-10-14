@@ -39,6 +39,11 @@ const SENSITIVE_KEYS = new Set([
   "storageState",
   "storage-state",
   "runtimeKey",
+  // ChatGPT Web Custom GPT selection: the ID alone opens a link-shared GPT, so the
+  // request extensions and the upstream gizmo field stay out of call-log artifacts.
+  "custom_gpt_id",
+  "custom_gpt_url",
+  "gizmo_id",
 ]);
 
 const SENSITIVE_CHALLENGE_KEYS = new Set([

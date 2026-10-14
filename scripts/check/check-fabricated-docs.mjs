@@ -165,6 +165,9 @@ const ENV_VAR_DENYLIST = new Set([
   "WEBSOCKET",
   "WEBHOOKS",
   "WEBHOOK_EVENTS",
+  // ChatGPT Web Custom GPT API error codes, not environment variables.
+  "INVALID_CUSTOM_GPT_ID",
+  "CUSTOM_GPT_NOT_ACCESSIBLE",
   "GUARDRAILS",
   "PROVIDER_NODES",
   "PROVIDER_NODES_VALIDATE",

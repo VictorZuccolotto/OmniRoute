@@ -43,6 +43,7 @@ export interface ChatGptWebBrowserSubmission {
   prompt: string;
   attachments: ChatGptWebResolvedAttachment[];
   signal?: AbortSignal | null;
+  customGptId?: string | null;
 }
 
 export interface ChatGptWebBrowserTurnRequest {
@@ -50,6 +51,8 @@ export interface ChatGptWebBrowserTurnRequest {
   attachments?: ChatGptWebResolvedAttachment[];
   timeoutMs?: number;
   signal?: AbortSignal | null;
+  /** Normalized `g-...` ID; omitted or null keeps the primary assistant. */
+  customGptId?: string | null;
 }
 
 export interface ChatGptWebBrowserTurnResult {
@@ -217,7 +220,8 @@ class ChatGptWebBrowserTurnRunner {
   constructor(
     private readonly session: ChatGptWebBrowserSession,
     private readonly prompt: string,
-    private readonly attachments: ChatGptWebResolvedAttachment[]
+    private readonly attachments: ChatGptWebResolvedAttachment[],
+    private readonly customGptId: string | null = null
   ) {
     this.resultPromise = new Promise((resolve, reject) => {
       this.resolveResult = resolve;
@@ -356,6 +360,7 @@ class ChatGptWebBrowserTurnRunner {
         prompt: this.prompt,
         attachments: this.attachments,
         signal: this.turnController.signal,
+        ...(this.customGptId ? { customGptId: this.customGptId } : {}),
       })
       .then((directResponse) => {
         if (typeof directResponse !== "string" || this.settled) return;
@@ -400,7 +405,12 @@ export async function runChatGptWebBrowserTurn(
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new Error("ChatGPT Web browser turn requires a positive timeout");
   }
-  const runner = new ChatGptWebBrowserTurnRunner(session, prompt, request.attachments ?? []);
+  const runner = new ChatGptWebBrowserTurnRunner(
+    session,
+    prompt,
+    request.attachments ?? [],
+    request.customGptId ?? null
+  );
   return runner.run(timeoutMs, request.signal);
 }
 
@@ -472,6 +482,7 @@ export class PlaywrightChatGptWebBrowserSession implements ChatGptWebBrowserSess
         prompt: requirePrompt(request.prompt),
         attachments: request.attachments,
         selection: this.selection,
+        ...(request.customGptId ? { customGptId: request.customGptId } : {}),
       },
       { signal: request.signal }
     );
