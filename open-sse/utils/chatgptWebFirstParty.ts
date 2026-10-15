@@ -13,6 +13,8 @@ export interface ChatGptWebFirstPartyModuleContract {
   buildSentinelHeaders: string;
   resolveIntegrity?: string;
   resolveIntegrityModule?: string;
+  /** Webpack id of the integrity module's uuid dependency; minified, so it changes per deploy. */
+  resolveIntegrityDependency?: string;
 }
 
 type PartialFirstPartyModuleContract = Partial<ChatGptWebFirstPartyModuleContract>;
@@ -133,7 +135,21 @@ export function parseChatGptWebFirstPartyModuleContract(
   return contract as ChatGptWebFirstPartyModuleContract;
 }
 
-function parsePartialChatGptWebFirstPartyModuleContract(
+/**
+ * The integrity module requires a single webpack dependency, the uuid v4 generator it calls as
+ * `(0,x.a)()`. Its id is minified and changes between ChatGPT deployments ("TI", later "DD").
+ */
+function integrityModuleDependency(source: string, moduleStart: number): string | undefined {
+  const rest = source.slice(moduleStart + 1);
+  const nextModule = rest.search(/\}\),[A-Za-z0-9_$]+:\(function\(e,t,n\)/);
+  const moduleSource = nextModule >= 0 ? rest.slice(0, nextModule) : rest;
+  const dependencies = new Set(
+    [...moduleSource.matchAll(/\bn\("([A-Za-z0-9_$]+)"\)/g)].map((match) => match[1])
+  );
+  return dependencies.size === 1 ? [...dependencies][0] : undefined;
+}
+
+export function parsePartialChatGptWebFirstPartyModuleContract(
   source: string
 ): PartialFirstPartyModuleContract {
   const result: PartialFirstPartyModuleContract = {};
@@ -189,6 +205,8 @@ function parsePartialChatGptWebFirstPartyModuleContract(
     if (resolveIntegrityExport) {
       result.resolveIntegrity = resolveIntegrityExport;
       result.resolveIntegrityModule = moduleId;
+      const dependency = integrityModuleDependency(source, integrityModule.index ?? 0);
+      if (dependency) result.resolveIntegrityDependency = dependency;
     }
   }
 
@@ -357,6 +375,9 @@ async function inspectFirstPartyAsset(
           ? {
               resolveIntegrity: state.partial.resolveIntegrity,
               resolveIntegrityModule: state.partial.resolveIntegrityModule,
+              ...(state.partial.resolveIntegrityDependency
+                ? { resolveIntegrityDependency: state.partial.resolveIntegrityDependency }
+                : {}),
             }
           : {}),
       };
@@ -411,7 +432,7 @@ async function discoverFirstPartyModule(page: Page): Promise<FirstPartyModuleRes
   });
 }
 
-function buildBridgeModuleSource(
+export function buildBridgeModuleSource(
   assetUrl: string,
   contract: ChatGptWebFirstPartyModuleContract
 ): string {
@@ -427,7 +448,7 @@ function buildBridgeModuleSource(
       `if (typeof factory !== "function") throw new Error("ChatGPT integrity module factory is unavailable");`,
       `const exports = {};`,
       `const requireShim = id => {`,
-      `if (id === "TI") return { a: () => crypto.randomUUID() };`,
+      `if (id === "TI" || id === names.resolveIntegrityDependency) return { a: () => crypto.randomUUID() };`,
       `throw new Error("Unsupported ChatGPT integrity dependency: " + id);`,
       `};`,
       `requireShim.d = (target, definitions) => {`,
